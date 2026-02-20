@@ -2,7 +2,7 @@ from fastapi import FastAPI,APIRouter,Depends, HTTPException, Header
 from sqlalchemy import create_engine,Column,Integer,String,ForeignKey,DateTime, Boolean,Date,and_
 from sqlalchemy.orm import sessionmaker,declarative_base,relationship,Session
 from pydantic import BaseModel,EmailStr,field_validator
-from typing import List,Optional
+from typing import List,Optional,func
 from datetime import date, datetime
 import psycopg2
 
@@ -803,3 +803,135 @@ def dashboard(db: Session = Depends(get_db), x_college_id: int = Header(...)):
     }
 
 app.include_router(dashboard_router)
+
+analytics_router = APIRouter(prefix="/analytics", tags=["analytics"])
+
+@analytics_router.get("/student/{student_id}")
+def student_analytics(
+    student_id: int,
+    db: Session = Depends(get_db),
+    x_college_id: int = Header(...)
+):
+    student = db.query(Student).filter(
+        Student.id == student_id,
+        Student.college_id == x_college_id
+    ).first()
+
+    if not student:
+        raise HTTPException(status_code=404, detail="Student not found")
+
+    total_issued = db.query(IssuedBook).filter(
+        IssuedBook.student_id == student_id,
+        IssuedBook.college_id == x_college_id
+    ).count()
+
+    returned_late = db.query(IssuedBook).filter(
+        IssuedBook.student_id == student_id,
+        IssuedBook.is_returned == True,
+        IssuedBook.fine_amount > 0,
+        IssuedBook.college_id == x_college_id
+    ).count()
+
+    returned_on_time = db.query(IssuedBook).filter(
+        IssuedBook.student_id == student_id,
+        IssuedBook.is_returned == True,
+        IssuedBook.fine_amount == 0,
+        IssuedBook.college_id == x_college_id
+    ).count()
+
+    currently_issued = db.query(IssuedBook).filter(
+        IssuedBook.student_id == student_id,
+        IssuedBook.is_returned == False,
+        IssuedBook.college_id == x_college_id
+    ).count()
+
+    total_fine = db.query(
+        func.coalesce(func.sum(IssuedBook.fine_amount), 0)
+    ).filter(
+        IssuedBook.student_id == student_id,
+        IssuedBook.college_id == x_college_id
+    ).scalar()
+
+    return {
+        "student_id": student_id,
+        "total_issued": total_issued,
+        "returned_on_time": returned_on_time,
+        "returned_late": returned_late,
+        "currently_issued": currently_issued,
+        "total_fine_paid": total_fine
+    }
+
+#Most Active Students (Top 5)
+@analytics_router.get("/top-students")
+def top_students(
+    db: Session = Depends(get_db),
+    x_college_id: int = Header(...)
+):
+    result = db.query(
+        IssuedBook.student_id,
+        func.count(IssuedBook.id).label("total_books")
+    ).filter(
+        IssuedBook.college_id == x_college_id
+    ).group_by(
+        IssuedBook.student_id
+    ).order_by(
+        func.count(IssuedBook.id).desc()
+    ).limit(5).all()
+
+    return result
+#most issued books (Top 5)
+@analytics_router.get("/top-books")
+def top_books(
+    db: Session = Depends(get_db),
+    x_college_id: int = Header(...)
+):
+    result = db.query(
+        IssuedBook.book_id,
+        func.count(IssuedBook.id).label("issue_count")
+    ).filter(
+        IssuedBook.college_id == x_college_id
+    ).group_by(
+        IssuedBook.book_id
+    ).order_by(
+        func.count(IssuedBook.id).desc()
+    ).limit(5).all()
+
+    return result
+#Monthly Fine Collection
+@analytics_router.get("/monthly-fine")
+def monthly_fine(
+    db: Session = Depends(get_db),
+    x_college_id: int = Header(...)
+):
+    result = db.query(
+        func.date_trunc('month', IssuedBook.return_date).label("month"),
+        func.sum(IssuedBook.fine_amount).label("total_fine")
+    ).filter(
+        IssuedBook.return_date != None,
+        IssuedBook.college_id == x_college_id
+    ).group_by(
+        func.date_trunc('month', IssuedBook.return_date)
+    ).all()
+
+    return result
+
+#top defaulters (students with highest fines)
+@analytics_router.get("/top-defaulters")
+def top_defaulters(
+    db: Session = Depends(get_db),
+    x_college_id: int = Header(...)
+):
+    result = db.query(
+        IssuedBook.student_id,
+        func.sum(IssuedBook.fine_amount).label("total_fine")
+    ).filter(
+        IssuedBook.college_id == x_college_id
+    ).group_by(
+        IssuedBook.student_id
+    ).order_by(
+        func.sum(IssuedBook.fine_amount).desc()
+    ).limit(5).all()
+
+    return result
+
+app.include_router(analytics_router)
