@@ -1,8 +1,8 @@
-from fastapi import FastAPI,APIRouter,Depends, HTTPException, Header
-from sqlalchemy import create_engine,Column,Integer,String,ForeignKey,DateTime, Boolean,Date,and_
+from fastapi import FastAPI,APIRouter,Depends, HTTPException, Header, Query
+from sqlalchemy import Float, create_engine,Column,Integer,String,ForeignKey,DateTime, Boolean,Date,and_,func
 from sqlalchemy.orm import sessionmaker,declarative_base,relationship,Session
 from pydantic import BaseModel,EmailStr,field_validator
-from typing import List,Optional,func
+from typing import List,Optional
 from datetime import date, datetime
 import psycopg2
 
@@ -46,9 +46,24 @@ class Student(Base):
     email=Column(String,unique=True,nullable=False)
     phone=Column(Integer,nullable=False)
     college_id = Column(Integer, nullable=False)
-
+    year = Column(Integer, nullable=True)
+    semester = Column(Integer, nullable=True)
+    academic_session = Column(String, nullable=False)  
+    department_id = Column(Integer, ForeignKey("department.id"))
+    
+    department_rel = relationship("Department", back_populates="students")
     issued_books = relationship("IssuedBook", back_populates="student", cascade="all, delete-orphan")   
+    exam_scores = relationship("ExamScore", back_populates="student", cascade="all, delete-orphan")
 
+
+class Department(Base):
+    __tablename__ = "department"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True, nullable=False)
+    college_id = Column(Integer, nullable=False)
+
+    students = relationship("Student", back_populates="department_rel")
 class Book(Base):
     __tablename__="book"
     id=Column(Integer,primary_key=True,index=True)
@@ -93,6 +108,24 @@ ROLE_ADMIN = "admin"
 ROLE_SUPER_ADMIN = "super_admin"
 
 
+class ExamScore(Base):
+    __tablename__ = "exam_score"
+
+    id = Column(Integer, primary_key=True, index=True)
+    student_id = Column(Integer, ForeignKey("student.id"))
+    college_id = Column(Integer, nullable=False)
+    exam_type = Column(String)  # unit1, unit2, half_yearly, final
+    hindi = Column(Integer, default=0)
+    english = Column(Integer, default=0)
+    maths = Column(Integer, default=0)
+    science = Column(Integer, default=0)
+    social_science = Column(Integer, default=0)
+    total = Column(Integer, default=0)
+    average = Column(Integer, default=0)
+    percentage = Column(Integer, default=0)
+    student = relationship("Student", back_populates="exam_scores")
+    grade_point = Column(Float, default=0)
+    is_pass = Column(Boolean, default=True)
 
 Base.metadata.create_all(bind=master_engine)
 
@@ -150,6 +183,10 @@ class StudentBase(BaseModel):
     name:str
     email:EmailStr
     phone:int
+    year: Optional[int] = None
+    semester: Optional[int] = None
+    academic_session: str
+    department: str
 
 
     @field_validator('email')
@@ -165,6 +202,35 @@ class StudentBase(BaseModel):
         if len(str(value)) !=10:
             raise ValueError("phone number must be 10 digits")
         return value
+    
+    @field_validator("semester")
+    @classmethod
+    def validate_year_semester(cls, v, values):
+        year = values.data.get("year")
+
+        if year is None and v is None:
+            raise ValueError("Either year or semester must be provided")
+
+        if year is not None and v is not None:
+            raise ValueError("Provide either year OR semester, not both")
+
+        return v
+    
+    @field_validator("academic_session")
+    @classmethod
+    def validate_session(cls, v):
+        # Format example: 2025-26
+        if len(v) != 7 or "-" not in v:
+            raise ValueError("Academic session must be in format YYYY-YY (example: 2025-26)")
+        return v
+    
+    @field_validator("department")
+    @classmethod
+    def validate_department(cls, v):
+        allowed_departments = ["BSc", "BCom", "BA", "BTech", "MBA"]
+        if v not in allowed_departments:
+            raise ValueError(f"Department must be one of {allowed_departments}")
+        return v
 
 
 
@@ -233,12 +299,45 @@ class UserResponse(BaseModel):
 #         db.close()
 
 
+class ExamScoreCreate(BaseModel):
+    student_id: int
+    exam_type: str
+
+    hindi: int
+    english: int
+    maths: int
+    science: int
+    social_science: int
+
+    year: Optional[int] = None
+    semester: Optional[int] = None
+
+    @field_validator("semester")
+    @classmethod
+    def validate_year_or_semester(cls, v, values):
+        year = values.data.get("year")
+        if year is None and v is None:
+            raise ValueError("Either year or semester must be provided")
+        return v
 
 
+class ExamScoreResponse(BaseModel):
+    id: int
+    student_id: int
+    exam_type: str
 
+    hindi: int
+    english: int
+    maths: int
+    science: int
+    social_science: int
 
+    total: int
+    average: float
+    percentage: float
 
-
+    class Config:
+        orm_mode = True
 
 
 college_router = APIRouter(prefix="/college", tags=["college"])
@@ -550,6 +649,33 @@ app.include_router(auth_router)
 
 
 
+department_router = APIRouter(prefix="/department", tags=["department"])
+
+@department_router.post("/")
+def create_department(
+    name: str,
+    db: Session = Depends(get_db),
+    x_college_id: int = Header(...)
+):
+    existing = db.query(Department).filter(
+        Department.name == name,
+        Department.college_id == x_college_id
+    ).first()
+
+    if existing:
+        raise HTTPException(status_code=400, detail="Department already exists")
+
+    dept = Department(name=name, college_id=x_college_id)
+    db.add(dept)
+    db.commit()
+
+    return {"message": "Department created"}
+
+
+
+app.include_router(department_router)
+
+
 
 student_router= APIRouter(prefix="/Student",tags=["student"])
 
@@ -802,6 +928,26 @@ def dashboard(db: Session = Depends(get_db), x_college_id: int = Header(...)):
         "issued_books": db.query(IssuedBook).filter(IssuedBook.is_returned == False, IssuedBook.college_id == x_college_id).count(),
     }
 
+
+
+@dashboard_router.get("/department-wise")
+def department_dashboard(
+    db: Session = Depends(get_db),
+    x_college_id: int = Header(...)
+):
+    result = db.query(
+        Department.name,
+        func.count(Student.id).label("total_students")
+    ).join(
+        Student, Student.department_id == Department.id
+    ).filter(
+        Department.college_id == x_college_id
+    ).group_by(
+        Department.name
+    ).all()
+
+    return result
+
 app.include_router(dashboard_router)
 
 analytics_router = APIRouter(prefix="/analytics", tags=["analytics"])
@@ -809,9 +955,16 @@ analytics_router = APIRouter(prefix="/analytics", tags=["analytics"])
 @analytics_router.get("/student/{student_id}")
 def student_analytics(
     student_id: int,
+    current_user: User = Depends(get_current_user),
+
     db: Session = Depends(get_db),
-    x_college_id: int = Header(...)
+    x_college_id: int = Header(...),
+
 ):
+    
+    if current_user.role == ROLE_STUDENT:
+        if current_user.id != student_id:
+            raise HTTPException(status_code=403, detail="Access denied")
     student = db.query(Student).filter(
         Student.id == student_id,
         Student.college_id == x_college_id
@@ -865,8 +1018,13 @@ def student_analytics(
 @analytics_router.get("/top-students")
 def top_students(
     db: Session = Depends(get_db),
-    x_college_id: int = Header(...)
+    x_college_id: int = Header(...),
+    current_user: User = Depends(get_current_user)
+
 ):
+    if current_user.role != ROLE_ADMIN:
+        raise HTTPException(status_code=403, detail="Only admin can view top students")
+
     result = db.query(
         IssuedBook.student_id,
         func.count(IssuedBook.id).label("total_books")
@@ -935,3 +1093,319 @@ def top_defaulters(
     return result
 
 app.include_router(analytics_router)
+
+
+
+exam_router = APIRouter(prefix="/exam", tags=["exam"])
+
+@exam_router.get("/analytics/year")
+def year_wise_exam_analytics(
+    year: int,
+    db: Session = Depends(get_db),
+    x_college_id: int = Header(...)
+):
+    result = db.query(
+        Student.year,
+        func.avg(ExamScore.percentage).label("avg_percentage")
+    ).join(
+        Student, Student.id == ExamScore.student_id
+    ).filter(
+        Student.year == year,
+        Student.college_id == x_college_id
+    ).group_by(Student.year).all()
+
+    return result
+
+
+
+@exam_router.get("/analytics/semester")
+def semester_wise_exam_analytics(
+    semester: int,
+    db: Session = Depends(get_db),
+    x_college_id: int = Header(...)
+):
+    result = db.query(
+        Student.semester,
+        func.avg(ExamScore.percentage).label("avg_percentage")
+    ).join(
+        Student, Student.id == ExamScore.student_id
+    ).filter(
+        Student.semester == semester,
+        Student.college_id == x_college_id
+    ).group_by(Student.semester).all()
+
+    return result
+
+
+@exam_router.post("/", response_model=ExamScoreResponse)
+def add_exam_score(
+    data: ExamScoreCreate,
+    db: Session = Depends(get_db),
+    x_college_id: int = Header(...)
+):
+    try:
+        
+        student = db.query(Student).filter(
+            Student.id == data.student_id,
+            Student.college_id == x_college_id
+        ).first()
+
+        if not student:
+            raise HTTPException(status_code=404, detail="Student not found")
+
+        if data.year and student.year != data.year:
+            raise HTTPException(status_code=400, detail="Student does not belong to this year")
+
+        if data.semester and student.semester != data.semester:
+            raise HTTPException(status_code=400, detail="Student does not belong to this semester")
+
+        existing_exam = db.query(ExamScore).filter(
+            ExamScore.student_id == data.student_id,
+            ExamScore.exam_type == data.exam_type,
+            ExamScore.college_id == x_college_id
+        ).first()
+
+        if existing_exam:
+            raise HTTPException(status_code=400, detail="Exam already exists for this student and exam type")
+
+        subjects = {
+            "hindi": data.hindi,
+            "english": data.english,
+            "maths": data.maths,
+            "science": data.science,
+            "social_science": data.social_science
+        }
+
+        for subject, marks in subjects.items():
+            if marks < 0 or marks > 100:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{subject} marks must be between 0 and 100"
+                )
+
+       
+        total = sum(subjects.values())
+        average = total / 5
+        percentage = (total / 500) * 100
+
+        if percentage >= 90:
+            grade_point = 10
+        elif percentage >= 80:
+            grade_point = 9
+        elif percentage >= 70:
+            grade_point = 8
+        elif percentage >= 60:
+            grade_point = 7
+        elif percentage >= 50:
+            grade_point = 6
+        elif percentage >= 40:
+            grade_point = 5
+        else:
+            grade_point = 0
+
+     
+        failed_subjects = [subject for subject, marks in subjects.items() if marks < 40]
+        is_pass = False if failed_subjects else True
+
+       
+        exam = ExamScore(
+            student_id=data.student_id,
+            college_id=x_college_id,
+            exam_type=data.exam_type,
+            **subjects,
+            total=total,
+            average=average,
+            percentage=percentage,
+            grade_point=grade_point,
+            is_pass=is_pass
+        )
+
+        db.add(exam)
+        db.commit()
+        db.refresh(exam)
+
+        return exam
+
+    except HTTPException:
+        db.rollback()
+        raise
+
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@exam_router.get("/student/{student_id}")
+def student_exam_summary(
+    student_id: int,
+    year: int | None = Query(default=None),
+    semester: int | None = Query(default=None),
+    db: Session = Depends(get_db),
+    x_college_id: int = Header(...)
+):
+    exams = db.query(ExamScore).filter(
+        ExamScore.student_id == student_id,
+        ExamScore.college_id == x_college_id
+    ).all()
+
+    if not exams:
+        raise HTTPException(status_code=404, detail="No exam records found")
+
+    overall_total = sum(exam.total for exam in exams)
+    overall_average = overall_total / (len(exams) * 5)
+    overall_percentage = (overall_total / (len(exams) * 500)) * 100
+
+    return {
+        "student_id": student_id,
+        "total_exams": len(exams),
+        "overall_total_marks": overall_total,
+        "overall_average": overall_average,
+        "overall_percentage": overall_percentage
+    }
+
+@exam_router.get("/cgpa/{student_id}")
+def calculate_cgpa(
+    student_id: int,
+    db: Session = Depends(get_db),
+    x_college_id: int = Header(...)
+):
+    exams = db.query(ExamScore).filter(
+        ExamScore.student_id == student_id,
+        ExamScore.college_id == x_college_id
+    ).all()
+
+    if not exams:
+        raise HTTPException(status_code=404, detail="No exam records found")
+
+    cgpa = sum(exam.grade_point for exam in exams) / len(exams)
+
+    return {
+        "student_id": student_id,
+        "total_exams": len(exams),
+        "cgpa": round(cgpa, 2)
+    }
+
+
+
+@exam_router.get("/result-status/{student_id}")
+def pass_fail_status(
+    student_id: int,
+    db: Session = Depends(get_db),
+    x_college_id: int = Header(...)
+):
+    exams = db.query(ExamScore).filter(
+        ExamScore.student_id == student_id,
+        ExamScore.college_id == x_college_id
+    ).all()
+
+    if not exams:
+        raise HTTPException(status_code=404, detail="No exams found")
+
+    failed_subjects = []
+
+    for exam in exams:
+        subjects = {
+            "hindi": exam.hindi,
+            "english": exam.english,
+            "maths": exam.maths,
+            "science": exam.science,
+            "social_science": exam.social_science
+        }
+
+        for subject, marks in subjects.items():
+            if marks < 40:
+                failed_subjects.append(subject)
+
+    status = "PASS" if not failed_subjects else "FAIL"
+
+    return {
+        "student_id": student_id,
+        "status": status,
+        "failed_subjects": failed_subjects
+    }
+
+
+
+def next_academic_session(session: str):
+    start_year = int(session.split("-")[0])
+    new_start = start_year + 1
+    new_end = str(new_start + 1)[-2:]
+    return f"{new_start}-{new_end}"
+
+@exam_router.get("/ranking")
+def student_ranking(
+    db: Session = Depends(get_db),
+    x_college_id: int = Header(...)
+):
+    result = db.query(
+        ExamScore.student_id,
+        func.avg(ExamScore.percentage).label("avg_percentage")
+    ).filter(
+        ExamScore.college_id == x_college_id
+    ).group_by(
+        ExamScore.student_id
+    ).order_by(
+        func.avg(ExamScore.percentage).desc()
+    ).all()
+
+    ranking = []
+    rank = 1
+
+    for row in result:
+        ranking.append({
+            "rank": rank,
+            "student_id": row.student_id,
+            "average_percentage": round(row.avg_percentage, 2)
+        })
+        rank += 1
+
+    return ranking
+
+
+
+app.include_router(exam_router)
+
+promotion_router = APIRouter(prefix="/promotion", tags=["promotion"])
+
+@promotion_router.post("/year")
+def promote_year_students(
+    db: Session = Depends(get_db),
+    x_college_id: int = Header(...)
+):
+    students = db.query(Student).filter(
+        Student.college_id == x_college_id,
+        Student.year != None
+    ).all()
+
+    for student in students:
+        if student.year < 3:
+            student.year += 1
+        else:
+            student.year = None  # Graduated
+
+    db.commit()
+
+    return {"message": "Year promotion completed"}
+
+
+@promotion_router.post("/semester")
+def promote_semester_students(
+    db: Session = Depends(get_db),
+    x_college_id: int = Header(...)
+):
+    students = db.query(Student).filter(
+        Student.college_id == x_college_id,
+        Student.semester != None
+    ).all()
+
+    for student in students:
+        if student.semester < 6:
+            student.semester += 1
+        else:
+            student.semester = None  # Graduated
+
+    db.commit()
+
+    return {"message": "Semester promotion completed"}
+
+
+app.include_router(promotion_router)
