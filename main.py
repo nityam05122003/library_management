@@ -1,7 +1,7 @@
 from fastapi import FastAPI,APIRouter,Depends, HTTPException, Header, Query
-from sqlalchemy import Float, create_engine,Column,Integer,String,ForeignKey,DateTime, Boolean,Date,and_,func
+from sqlalchemy import Float, UniqueConstraint, create_engine,Column,Integer,String,ForeignKey,DateTime, Boolean,Date,and_,func
 from sqlalchemy.orm import sessionmaker,declarative_base,relationship,Session
-from pydantic import BaseModel,EmailStr,field_validator
+from pydantic import BaseModel,EmailStr,field_validator,model_validator
 from typing import List,Optional
 from datetime import date, datetime
 import psycopg2
@@ -10,26 +10,22 @@ app = FastAPI(
     title ="Student Management API",
 )
 @app.get("/")
-async def home():
+def home():
     return {"message":"Student Management API - Dynamic Multi DB"}
 
 MASTER_DB_URL = "postgresql://postgres:123456@localhost:5432/master_db"
 master_engine = create_engine(MASTER_DB_URL)
 MasterSessionLocal = sessionmaker(bind=master_engine, autoflush=False, autocommit=False)
 
-Base = declarative_base()
+MasterBase = declarative_base()
+CollegeBase = declarative_base()
 
 STATIC_SUPER_ADMINS = [
     {"username": "nitya", "password": "1234"},
     {"username": "nityanand", "password": "5678"}
 ]
 
-
-
-
-
-
-class College(Base):
+class College(MasterBase):
     __tablename__ = "college"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -38,8 +34,7 @@ class College(Base):
     status = Column(String, default="active")
     created_at = Column(DateTime, default=datetime.utcnow)
 
-
-class Student(Base):
+class Student(CollegeBase):
     __tablename__ = "student"
     id = Column(Integer,primary_key=True,index=True)
     name= Column(String,nullable=False)
@@ -49,43 +44,39 @@ class Student(Base):
     year = Column(Integer, nullable=True)
     semester = Column(Integer, nullable=True)
     academic_session = Column(String, nullable=False)  
-    department_id = Column(Integer, ForeignKey("department.id"))
+    department_name = Column(String, ForeignKey("department.id"))
     
     department_rel = relationship("Department", back_populates="students")
     issued_books = relationship("IssuedBook", back_populates="student", cascade="all, delete-orphan")   
     exam_scores = relationship("ExamScore", back_populates="student", cascade="all, delete-orphan")
 
 
-class Department(Base):
+class Department(CollegeBase):
     __tablename__ = "department"
-
     id = Column(Integer, primary_key=True, index=True)
-    name = Column(String, unique=True, nullable=False)
+    name = Column(String, nullable=False)
     college_id = Column(Integer, nullable=False)
+    __table_args__ = (
+        UniqueConstraint("name", "college_id", name="unique_department_per_college"),)
 
     students = relationship("Student", back_populates="department_rel")
-class Book(Base):
+class Book(CollegeBase):
     __tablename__="book"
     id=Column(Integer,primary_key=True,index=True)
     title=Column(String,nullable=False)
     college_id = Column(Integer, nullable=False)
     created_by = Column(Integer, nullable=True)
-    
 
     issued_books = relationship("IssuedBook", back_populates="book", cascade="all, delete-orphan")
 
-
-class IssuedBook(Base):
+class IssuedBook(CollegeBase):
     __tablename__ = "issued_book"
-
     id = Column(Integer, primary_key=True, index=True)
     student_id = Column(Integer, ForeignKey("student.id"))
     book_id = Column(Integer, ForeignKey("book.id"))
-
     issue_date = Column(DateTime, default=datetime.utcnow)
     due_date = Column(Date, nullable=True)
     return_date = Column(DateTime, nullable=True)
-
     is_returned = Column(Boolean, default=False)
     fine_amount = Column(Integer, default=0)
     college_id = Column(Integer, nullable=False)
@@ -93,7 +84,7 @@ class IssuedBook(Base):
     student = relationship("Student", back_populates="issued_books", lazy="joined")
     book = relationship("Book", back_populates="issued_books", lazy="joined")
     
-class User(Base):
+class User(CollegeBase):
     __tablename__ = "users"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -108,7 +99,7 @@ ROLE_ADMIN = "admin"
 ROLE_SUPER_ADMIN = "super_admin"
 
 
-class ExamScore(Base):
+class ExamScore(CollegeBase):
     __tablename__ = "exam_score"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -127,7 +118,7 @@ class ExamScore(Base):
     grade_point = Column(Float, default=0)
     is_pass = Column(Boolean, default=True)
 
-Base.metadata.create_all(bind=master_engine)
+MasterBase.metadata.create_all(bind=master_engine)
 
 
 def create_college_database(db_name: str):
@@ -140,27 +131,52 @@ def create_college_database(db_name: str):
     )
     conn.autocommit = True
     cursor = conn.cursor()
-    cursor.execute(f"CREATE DATABASE {db_name}")
+    cursor.execute(f'CREATE DATABASE "{db_name}"')
     cursor.close()
     conn.close()
 
 
+def drop_college_database(db_name: str):
+    conn = psycopg2.connect(
+        dbname="postgres",
+        user="postgres",
+        password="123456",
+        host="localhost",
+        port="5432"
+    )
+    conn.autocommit = True
+    cursor = conn.cursor()
+
+    # Terminate active connections (VERY IMPORTANT)
+    cursor.execute(f"""
+        SELECT pg_terminate_backend(pid)
+        FROM pg_stat_activity
+        WHERE datname = '{db_name}'
+        AND pid <> pg_backend_pid();
+    """)
+
+    cursor.execute(f'DROP DATABASE IF EXISTS "{db_name}"')
+    cursor.close()
+    conn.close()
+
 def init_college_db(db_name: str):
     db_url = f"postgresql://postgres:123456@localhost:5432/{db_name}"
     engine = create_engine(db_url)
-    Base.metadata.create_all(bind=engine)
+    CollegeBase.metadata.create_all(bind=engine)
 
 
 def get_engine_by_college_id(college_id: int):
     db = MasterSessionLocal()
     college = db.query(College).filter(College.id == college_id).first()
     db.close()
-
     if not college:
         raise HTTPException(status_code=404, detail="College not found")
-
     db_url = f"postgresql://postgres:123456@localhost:5432/{college.db_name}"
-    return create_engine(db_url)
+    engine = create_engine(db_url)
+
+
+
+    return engine
 
 
 def get_db(x_college_id: int = Header(...)):
@@ -172,12 +188,8 @@ def get_db(x_college_id: int = Header(...)):
     finally:
         db.close()
 
-
-
 class CollegeCreate(BaseModel):
     name: str
-
-
 
 class StudentBase(BaseModel):
     name:str
@@ -186,7 +198,7 @@ class StudentBase(BaseModel):
     year: Optional[int] = None
     semester: Optional[int] = None
     academic_session: str
-    department: str
+    department_name: str
 
 
     @field_validator('email')
@@ -203,19 +215,15 @@ class StudentBase(BaseModel):
             raise ValueError("phone number must be 10 digits")
         return value
     
-    @field_validator("semester")
-    @classmethod
-    def validate_year_semester(cls, v, values):
-        year = values.data.get("year")
-
-        if year is None and v is None:
+    @model_validator(mode="after")
+    def validate_year_semester(self):
+        if self.year is None and self.semester is None:
             raise ValueError("Either year or semester must be provided")
 
-        if year is not None and v is not None:
+        if self.year is not None and self.semester is not None:
             raise ValueError("Provide either year OR semester, not both")
+        return self
 
-        return v
-    
     @field_validator("academic_session")
     @classmethod
     def validate_session(cls, v):
@@ -223,27 +231,18 @@ class StudentBase(BaseModel):
         if len(v) != 7 or "-" not in v:
             raise ValueError("Academic session must be in format YYYY-YY (example: 2025-26)")
         return v
-    
-    @field_validator("department")
-    @classmethod
-    def validate_department(cls, v):
-        allowed_departments = ["BSc", "BCom", "BA", "BTech", "MBA"]
-        if v not in allowed_departments:
-            raise ValueError(f"Department must be one of {allowed_departments}")
-        return v
-
-
 
 class StudentCreate(StudentBase):
     pass
 class StudentResponse(StudentCreate):
     id:int
-    name:str
-    email:EmailStr
-    phone:int
-
-    
-
+    name: str
+    email: EmailStr
+    phone: int
+    year: Optional[int]
+    semester: Optional[int]
+    academic_session: str
+    department_name: str
 
     class Config:
         orm_mode=True
@@ -312,13 +311,14 @@ class ExamScoreCreate(BaseModel):
     year: Optional[int] = None
     semester: Optional[int] = None
 
-    @field_validator("semester")
-    @classmethod
-    def validate_year_or_semester(cls, v, values):
-        year = values.data.get("year")
-        if year is None and v is None:
+    @model_validator(mode="after")
+    def validate_year_semester(self):
+        if self.year is None and self.semester is None:
             raise ValueError("Either year or semester must be provided")
-        return v
+
+        if self.year is not None and self.semester is not None:
+            raise ValueError("Provide either year OR semester, not both")   
+        return self
 
 
 class ExamScoreResponse(BaseModel):
@@ -392,6 +392,36 @@ def get_all_colleges(
         for college in colleges
     ]
 
+@college_router.delete("/{college_id}")
+def delete_college(
+    college_id: int,
+    username: str = Header(...),
+    password: str = Header(...)
+):
+    #  Only super admin
+    authenticate_super_admin(username, password)
+
+    db = MasterSessionLocal()
+
+    college = db.query(College).filter(College.id == college_id).first()
+
+    if not college:
+        db.close()
+        raise HTTPException(status_code=404, detail="College not found")
+
+    db_name = college.db_name
+
+    # Delete record from master DB
+    db.delete(college)
+    db.commit()
+    db.close()
+
+    # Drop the actual database
+    drop_college_database(db_name)
+
+    return {"message": "College deleted successfully"}
+
+
 app.include_router(college_router)
 
 
@@ -437,9 +467,19 @@ def role_required(allowed_roles: list):
 auth_router = APIRouter(prefix="/auth", tags=["auth"])
 
 @auth_router.post("/login")
-def login(username: str, password: str, db: Session = Depends(get_db), x_college_id: int = Header(...)):
+def login(
+    username: str = Header(...),
+    password: str = Header(...),
+    x_college_id: int = Header(...),
+    db: Session = Depends(get_db)
+):
     user = authenticate_user(db, username, password, x_college_id)
-    return {"message": "Login successful", "role": user.role}
+
+    return {
+        "message": "Login successful",
+        "role": user.role,
+        "user_id": user.id
+    }
 
 # @auth_router.post("/signup")
 # def signup(user: UserCreate, db: Session = Depends(get_db), x_college_id: int = Header(...)):
@@ -463,16 +503,37 @@ def login(username: str, password: str, db: Session = Depends(get_db), x_college
 
 
 @auth_router.post("/signup")
-def signup(user: UserCreate, db: Session = Depends(get_db), x_college_id: int = Header(...)):
+def signup(
+    user: UserCreate,
+    db: Session = Depends(get_db),
+    x_college_id: int = Header(...)
+):
+    master_db = MasterSessionLocal()
 
-    existing_user = db.query(User).filter(User.username == user.username).first()
+    college = master_db.query(College).filter(
+        College.id == x_college_id
+    ).first()
+
+    master_db.close()
+
+    if not college:
+        raise HTTPException(status_code=404, detail="College not found")
+
+    existing_user = db.query(User).filter(
+        User.username == user.username,
+        User.college_id == x_college_id
+    ).first()
+
     if existing_user:
-        raise HTTPException(status_code=400, detail="Username already exists")
+        raise HTTPException(
+            status_code=400,
+            detail="Username already exists in this college"
+        )
 
     new_user = User(
         username=user.username,
         password=user.password,
-        role=ROLE_STUDENT,  #  forced student role
+        role="student",
         college_id=x_college_id
     )
 
@@ -480,8 +541,16 @@ def signup(user: UserCreate, db: Session = Depends(get_db), x_college_id: int = 
     db.commit()
     db.refresh(new_user)
 
-    return {"message": "Student registered successfully"}
-
+    #  RETURN SAFE JSON
+    return {
+        "message": "User created successfully",
+        "user": {
+            "id": new_user.id,
+            "username": new_user.username,
+            "role": new_user.role,
+            "college_id": new_user.college_id
+        }
+    }
 @auth_router.post("/create-admin")
 def create_admin(
     username: str,
@@ -534,15 +603,18 @@ def get_current_user(
 
 
 def get_admin_user(
-    admin_username: str = Header(...),
+    username: str = Header(...),
     password: str = Header(...),
     db: Session = Depends(get_db),
     x_college_id: int = Header(...)
 ):
-    user = authenticate_user(db, admin_username, password, x_college_id)
+    user = authenticate_user(db, username, password, x_college_id)
 
     if user.role != ROLE_ADMIN:
-        raise HTTPException(status_code=403, detail="Admin access required")
+        raise HTTPException(
+            status_code=403,
+            detail="Admin access required"
+        )
 
     return user
 
@@ -594,16 +666,18 @@ def create_librarian(
     user: UserCreate,
     db: Session = Depends(get_db),
     x_college_id: int = Header(...),
-    current_user: User = Depends(get_admin_or_librarian_user)
+    current_user: User = Depends(get_admin_user)   # only admin allowed
 ):
     
-    #  Only admin can create librarian
-    if current_user.role != "admin":
-        raise HTTPException(status_code=403, detail="Only admin can create librarian")
+    existing_user = db.query(User).filter(
+        User.username == user.username
+    ).first()
 
-    existing_user = db.query(User).filter(User.username == user.username).first()
     if existing_user:
-        raise HTTPException(status_code=400, detail="Username already exists")
+        raise HTTPException(
+            status_code=400,
+            detail="Username already exists"
+        )
 
     librarian = User(
         username=user.username,
@@ -666,12 +740,47 @@ def create_department(
         raise HTTPException(status_code=400, detail="Department already exists")
 
     dept = Department(name=name, college_id=x_college_id)
-    db.add(dept)
-    db.commit()
+
+    try:
+        db.add(dept)
+        db.commit()
+        db.refresh(dept)
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
 
     return {"message": "Department created"}
 
 
+
+@department_router.get("/all")
+def list_departments(
+    db: Session = Depends(get_db),
+    x_college_id: int = Header(...),
+    username: str = Header(...),
+    password: str = Header(...)
+):
+    # First try super admin authentication
+    try:
+        authenticate_super_admin(username, password)
+        # If super admin → allow access
+        return db.query(Department).filter(
+            Department.college_id == x_college_id
+        ).all()
+
+    except HTTPException:
+        # If not super admin → check if admin of that college
+        user = authenticate_user(db, username, password, x_college_id)
+
+        if user.role != ROLE_ADMIN:
+            raise HTTPException(
+                status_code=403,
+                detail="Only Super Admin or Admin can view departments"
+            )
+
+        return db.query(Department).filter(
+            Department.college_id == x_college_id
+        ).all()
 
 app.include_router(department_router)
 
@@ -684,57 +793,151 @@ def create_student(
     student: StudentCreate,
     db: Session = Depends(get_db),
     x_college_id: int = Header(...),
-    current_user: User = Depends(get_admin_or_librarian_user)
+    current_user: User = Depends(get_admin_user)
 ):
-    if current_user.role not in [ROLE_LIBRARIAN, ROLE_ADMIN]:
-        raise HTTPException(status_code=403, detail="Only librarian or admin can create students")
+    
+    # 🔎 Find department by name
+    department = db.query(Department).filter(
+        Department.name == student.department_name,
+        Department.college_id == x_college_id
+    ).first()
 
-    db_student = Student(**student.dict(), college_id=x_college_id)
+    if not department:
+        raise HTTPException(status_code=404, detail="Department not found")
+
+    # Convert model to dict
+    student_data = student.dict()
+    student_data.pop("department_name")  # remove name field
+
+    # Create student using department_id
+    db_student = Student(
+        **student_data,
+        department_id=department.id,
+        college_id=x_college_id
+    )
+
     db.add(db_student)
     db.commit()
     db.refresh(db_student)
-    return db_student
+
+    return {"id": db_student.id,
+        "name": db_student.name,
+        "email": db_student.email,
+        "phone": db_student.phone,
+        "year": db_student.year,
+        "semester": db_student.semester,
+        "academic_session": db_student.academic_session,
+        "department_name": department.name}@student_router.get("/", response_model=List[StudentResponse])
 
 @student_router.get("/", response_model=List[StudentResponse])
 def get_all_student(
     db: Session = Depends(get_db),
     x_college_id: int = Header(...),
-    current_user: User = Depends(get_admin_or_librarian_user)
+    current_user: User = Depends(get_admin_user)
 ):
-    return db.query(Student).filter(Student.college_id == x_college_id).all()
+    students = db.query(Student).filter(
+        Student.college_id == x_college_id
+    ).all()
+
+    result = []
+
+    for student in students:
+        department = db.query(Department).filter(
+            Department.id == student.department_id
+        ).first()
+
+        result.append({
+            "id": student.id,
+            "name": student.name,
+            "email": student.email,
+            "phone": student.phone,
+            "year": student.year,
+            "semester": student.semester,
+            "academic_session": student.academic_session,
+            "department_name": department.name if department else None
+        })
+
+    return result
 
 
 
-@student_router.get("/{student_id}",response_model=StudentResponse)
-def get_student_by_id(student_id:int,db:Session= Depends(get_db), x_college_id: int = Header(...)):
-    student_obj=db.query(Student).filter(Student.id==student_id, Student.college_id == x_college_id).first()
+@student_router.get("/{student_id}", response_model=StudentResponse)
+def get_student_by_id(
+    student_id: int,
+    db: Session = Depends(get_db),
+    x_college_id: int = Header(...),
+    current_user: User = Depends(get_admin_user)
+):
+    student_obj = db.query(Student).filter(
+        Student.id == student_id,
+        Student.college_id == x_college_id
+    ).first()
 
     if not student_obj:
-        raise HTTPException(status_code=404,detail="student not found")
-    
-    return student_obj
+        raise HTTPException(status_code=404, detail="Student not found")
 
-@student_router.put("/{student_id}",response_model=StudentResponse)
-def update_student(student:StudentCreate,student_id:int,db:Session= Depends(get_db), x_college_id: int = Header(...)):
-    student_obj=db.query(Student).filter(Student.id==student_id, Student.college_id == x_college_id).first()
+    department = db.query(Department).filter(
+        Department.id == student_obj.department_id
+    ).first()
+
+    return {
+        "id": student_obj.id,
+        "name": student_obj.name,
+        "email": student_obj.email,
+        "phone": student_obj.phone,
+        "year": student_obj.year,
+        "semester": student_obj.semester,
+        "academic_session": student_obj.academic_session,
+        "department_name": department.name if department else None
+    }
+
+# UPDATE STUDENT (Admin Only)
+@student_router.put("/{student_id}", response_model=StudentResponse)
+def update_student(
+    student: StudentCreate,
+    student_id: int,
+    db: Session = Depends(get_db),
+    x_college_id: int = Header(...),
+    current_user: User = Depends(get_admin_user)
+):
+    student_obj = db.query(Student).filter(
+        Student.id == student_id,
+        Student.college_id == x_college_id
+    ).first()
 
     if not student_obj:
-        raise HTTPException(status_code=404,detail="student not found")
-    
-    # student_obj.name=student.name
-    # student_obj.email=student.email
-    # student_obj.phone=student.phone
+        raise HTTPException(status_code=404, detail="Student not found")
 
+    # 🔎 Find department
+    department = db.query(Department).filter(
+        Department.name == student.department_name,
+        Department.college_id == x_college_id
+    ).first()
 
-    for key ,value in student.dict().items():
-        setattr(student_obj,key,value)
+    if not department:
+        raise HTTPException(status_code=404, detail="Department not found")
 
+    student_data = student.dict()
+    student_data.pop("department_name")
 
+    for key, value in student_data.items():
+        setattr(student_obj, key, value)
+
+    student_obj.department_id = department.id
 
     db.commit()
     db.refresh(student_obj)
-    return student_obj
 
+    return {
+        "id": student_obj.id,
+        "name": student_obj.name,
+        "email": student_obj.email,
+        "phone": student_obj.phone,
+        "year": student_obj.year,
+        "semester": student_obj.semester,
+        "academic_session": student_obj.academic_session,
+        "department_name": department.name
+    }
 
 @student_router.delete("/{student_id}")
 def delete_student(
@@ -743,14 +946,19 @@ def delete_student(
     x_college_id: int = Header(...),
     current_user: User = Depends(get_admin_user)
 ):
-    student_obj = db.query(Student).filter(Student.id == student_id, Student.college_id == x_college_id).first()
+    student_obj = db.query(Student).filter(
+        Student.id == student_id,
+        Student.college_id == x_college_id
+    ).first()
+
     if not student_obj:
-        raise HTTPException(status_code=404, detail="student not found")
+        raise HTTPException(status_code=404, detail="Student not found")
 
     db.delete(student_obj)
     db.commit()
 
-    return {"message": "student deleted successfully"}
+    return {"message": "Student deleted successfully"}
+
 
 
 
