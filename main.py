@@ -1,3 +1,5 @@
+from unittest import result
+
 from fastapi import FastAPI,APIRouter,Depends, HTTPException, Header, Query
 from sqlalchemy import Float, UniqueConstraint, create_engine,Column,Integer,String,ForeignKey,DateTime, Boolean,Date,and_,func
 from sqlalchemy.orm import sessionmaker,declarative_base,relationship,Session
@@ -44,7 +46,7 @@ class Student(CollegeBase):
     year = Column(Integer, nullable=True)
     semester = Column(Integer, nullable=True)
     academic_session = Column(String, nullable=False)  
-    department_name = Column(String, ForeignKey("department.id"))
+    department_id = Column(Integer, ForeignKey("department.id"))
     
     department_rel = relationship("Department", back_populates="students")
     issued_books = relationship("IssuedBook", back_populates="student", cascade="all, delete-orphan")   
@@ -827,7 +829,8 @@ def create_student(
         "year": db_student.year,
         "semester": db_student.semester,
         "academic_session": db_student.academic_session,
-        "department_name": department.name}@student_router.get("/", response_model=List[StudentResponse])
+        "department_name": department.name
+    }
 
 @student_router.get("/", response_model=List[StudentResponse])
 def get_all_student(
@@ -1145,19 +1148,26 @@ def department_dashboard(
 ):
     result = db.query(
         Department.name,
-        func.count(Student.id).label("total_students")
-    ).join(
-        Student, Student.department_id == Department.id
+        func.count(Student.id)
+    ).outerjoin(
+        Student,
+        and_(
+            Student.department_id == Department.id,
+            Student.college_id == x_college_id
+        )
     ).filter(
         Department.college_id == x_college_id
     ).group_by(
         Department.name
     ).all()
 
-    return result
+    return [
+        {"department_name": row[0], "total_students": row[1]}
+        for row in result
+    ]
+
 
 app.include_router(dashboard_router)
-
 analytics_router = APIRouter(prefix="/analytics", tags=["analytics"])
 
 @analytics_router.get("/student/{student_id}")
@@ -1244,8 +1254,13 @@ def top_students(
         func.count(IssuedBook.id).desc()
     ).limit(5).all()
 
-    return result
-#most issued books (Top 5)
+    return [
+    {
+        "student_id": row.student_id,
+        "total_books": row.total_books
+    }
+    for row in result
+]#most issued books (Top 5)
 @analytics_router.get("/top-books")
 def top_books(
     db: Session = Depends(get_db),
@@ -1262,7 +1277,13 @@ def top_books(
         func.count(IssuedBook.id).desc()
     ).limit(5).all()
 
-    return result
+    return  [
+    {
+        "book_id": row.book_id,
+        "issue_count": row.issue_count
+    }
+    for row in result
+]
 #Monthly Fine Collection
 @analytics_router.get("/monthly-fine")
 def monthly_fine(
@@ -1279,8 +1300,13 @@ def monthly_fine(
         func.date_trunc('month', IssuedBook.return_date)
     ).all()
 
-    return result
-
+    return [
+    {
+        "month": row.month.strftime("%Y-%m") if row.month else None,
+        "total_fine": float(row.total_fine or 0)
+    }
+    for row in result
+]
 #top defaulters (students with highest fines)
 @analytics_router.get("/top-defaulters")
 def top_defaulters(
@@ -1298,8 +1324,13 @@ def top_defaulters(
         func.sum(IssuedBook.fine_amount).desc()
     ).limit(5).all()
 
-    return result
-
+    return [
+    {
+        "student_id": row.student_id,
+        "total_fine": float(row.total_fine or 0)
+    }
+    for row in result
+]
 app.include_router(analytics_router)
 
 
